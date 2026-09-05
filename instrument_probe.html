@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DD Probe Instrumenter</title>
+<style>
+body{font-family:-apple-system,Roboto,Arial,sans-serif;margin:12px;background:#111;color:#ddd}
+input{width:100%;box-sizing:border-box;padding:10px;font-size:14px;margin:6px 0;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
+button{padding:12px 18px;font-size:15px;border-radius:8px;border:0;background:#17bbf4;color:#000;margin:6px 4px}
+pre{background:#000;color:#9f9;padding:12px;border-radius:8px;white-space:pre-wrap;font-size:11px;max-height:70vh;overflow:auto}
+</style>
+</head>
+<body>
+<h3>DD Probe Instrumenter</h3>
+<label>Challenge seed (string t):</label>
+<input id="seed" value="4ade955f-23fd-7e7f-b864-683346e9bd33" placeholder="paste ddm.seed">
+<label>Extra string (e.g. cid) optional:</label>
+<input id="extra" value="" placeholder="optional">
+<button onclick="runProbe()">Run Probe</button>
+<button onclick="startSensors()">Run Sensors (2.5s)</button>
+<button onclick="copyLog()">Copy Log</button>
+<pre id="log">press Run Probe...</pre>
+<script>
+const LOG = [];
+function log(msg){ LOG.push(msg); const el=document.getElementById('log'); el.textContent = LOG.join('\n'); }
+function cpy(){ }
+
+function hex(arr){ let s=''; for (const b of arr) s += b.toString(16).padStart(2,'0'); return s; }
+
+async function sha256(bytes){
+  const h = await crypto.subtle.digest('SHA-256', bytes);
+  return new Uint8Array(h);
+}
+
+function drawFrameInfo(t, _unusedN, e, h){
+  // exact datadome probe semantics (from v1.32 worker): f/u RNG + l palette + c draws
+  const r = h.offsetParameter, a = h.multiplier, i = h.fontSizeFactor, g = h.maxShadowBlur;
+  function f(t){ this.currentNumber = t % r; if (this.currentNumber <= 0) this.currentNumber += r; }
+  function u(t,e,n){ t = (t-1)/r; return n ? t*e : Math.floor(t*e); }
+  f.prototype.getNext = function(){ return this.currentNumber = Math.max(a*this.currentNumber%r, 2), this.currentNumber; };
+  const l = ["#FF6633","#FFB399","#FF33FF","#FFFF99","#00B3E6","#E6B333","#3366E6","#999966","#99FF99","#B34D4D","#80B300","#809900","#E6B3B3","#6680B3","#66991A","#FF99E6","#CCFF1A","#FF1A66","#E6331A","#33FFCC","#66994D","#B366CC","#4D8000","#B33300","#CC80CC","#66664D","#991AFF","#E666FF","#4DB3FF","#1AB399","#E666B3","#33991A","#CC9999","#B3B31A","#00E680","#4D8066","#809980","#E6FF80","#1AFF33","#999933","#FF3380","#CCCC00","#66E64D","#4D80CC","#9900B3","#E64D66","#4DB380","#FF4D4D","#99E6E6","#6666FF"];
+  const ct = [function(t,e,n){ e.beginPath(); e.arc(u(t.getNext(),n.width/2),u(t.getNext(),n.height/2),u(t.getNext(),Math.min(n.width/4,n.height/4)),u(t.getNext(),2*Math.PI,!0),u(t.getNext(),2*Math.PI,!0)); e.stroke(); },
+    function(t,e,n){ var r=Math.max(1,u(t.getNext(),5)); var a=(function(t,e){ for(var n=[],r=0;r<e;r++){ var a=65+t.getNext()%61; n.push(String.fromCharCode(a)); } return n.join(""); })(t,r); e.font = n.height/i + "px aafakefontaa"; e.fillText(a,u(t.getNext(),n.width),u(t.getNext(),n.height),u(t.getNext(),n.width)); },
+    function(t,e,n){ e.beginPath(); e.moveTo(u(t.getNext(),n.width),u(t.getNext(),n.height)); e.bezierCurveTo(u(t.getNext(),n.width),u(t.getNext(),n.height),u(t.getNext(),n.width),u(t.getNext(),n.height),u(t.getNext(),n.width),u(t.getNext(),n.height)); e.stroke(); },
+    function(t,e,n){ e.beginPath(); e.moveTo(u(t.getNext(),n.width),u(t.getNext(),n.height)); e.quadraticCurveTo(u(t.getNext(),n.width),u(t.getNext(),n.height),u(t.getNext(),n.width),u(t.getNext(),n.height)); e.stroke(); }];
+  // capture RNG stream
+  const d = new f(t);
+  const nexts = [];
+  for (let k = 0; k < 32; k++) nexts.push(d.getNext());
+  log("RNG stream (first 32): " + JSON.stringify(nexts));
+
+  let s;
+  try {
+    s = new OffscreenCanvas(e.width, e.height);
+  } catch (err) {
+    log('OffscreenCanvas err: ' + err.message);
+    s = document.createElement('canvas');
+    s.width = e.width; s.height = e.height;
+  }
+  const N = s.getContext('2d');
+  log('canvas ctx obtained: ' + !!N);
+  function w(t2){
+    // gradient + shadow + draw (faithful)
+    const gr = N.createRadialGradient(u(d.getNext(),e.width),u(d.getNext(),e.height),u(d.getNext(),e.width),u(d.getNext(),e.width),u(d.getNext(),e.height),u(d.getNext(),e.width));
+    // addColorStop indices
+    const cs0 = u(d.getNext(),l.length), cs1 = u(d.getNext(),l.length);
+    gr.addColorStop(0, l[cs0]); gr.addColorStop(1, l[cs1]);
+    N.fillStyle = gr;
+    N.shadowBlur = u(d.getNext(), g);
+    N.shadowColor = l[u(d.getNext(), l.length)];
+    let fn;
+    if (t2 === 0) fn = ct[1];
+    else if (t2 === 1) { fn = function(tt,ee,nn){ var r=Math.max(1,u(tt.getNext(),5)); var a=String.fromCharCode(9654,65039); ee.font = nn.height/i + "px aafakefontaa"; ee.fillText(a+r, u(tt.getNext(),nn.width), u(tt.getNext(),nn.height), u(tt.getNext(),nn.width)); }; }
+    else fn = ct[u(d.getNext(), ct.length)];
+    fn(d, N, e);
+    N.fill();
+  }
+  // draw all 8 frames & digest each
+  const m = [];
+  let pixsums = [];
+  for (let v = 0; v <= 7; v++) {
+    N.clearRect(0,0,e.width,e.height);
+    w(7 - v);
+    let F;
+    try { F = N.getImageData(0,0,s.width,s.height); } catch(err) { log('getImageData err: ' + err.message); F = { data: new Uint8ClampedArray(4), width:1, height:1 }; }
+    let ps = 0;
+    for (let k = 0; k < F.data.length; k += 397) ps += F.data[k];
+    pixsums.push(ps);
+    m.push(sha256(F.data));
+  }
+  log('frame pixel checksums: ' + JSON.stringify(pixsums));
+  return { frames: m };
+}
+
+async function runProbe(){
+  try {
+    LOG.length = 0;
+    const t = document.getElementById('seed').value;
+    const extra = document.getElementById('extra').value;
+    log('seed string t: ' + t);
+    log('extra string: ' + extra);
+    // derive o exactly like the SDK: r = sum charcodes, mod 10 (+1 if 0)
+    let ssum = 0;
+    for (let i = 0; i < t.length; i++) ssum += t.charCodeAt(i);
+    log('sum(codes): ' + ssum);
+    let r = ssum % 10; if (r === 0) r++;
+    log('r (=draw seed o): ' + r);
+    log('frame1 offset info: a[0]=7 a[1]=' + r);
+
+    const cfg = { width: 300, height: 300 };
+    const area = { width: 300, height: 300 };
+    const h = { area, offsetParameter: 2001000001, fontSizeFactor: 1.5, multiplier: 15000, maxShadowBlur: 50 };
+    const res = await drawFrameInfo(r, null, area, h);
+    for (let i = 0; i < res.frames.length; i++) {
+      const arr = await res.frames[i];
+      log('frame' + i + ' sha256: ' + hex(arr));
+    }
+    // concat + final hash
+    const all = new Uint8Array(res.frames.length * 32);
+    for (let i = 0; i < res.frames.length; i++) all.set(res.frames[i], i * 32);
+    const finalh = await sha256(all);
+    log('CONCAT(8 frames) sha256: ' + hex(finalh));
+    log('ALL_CONCAT_B64: ' + btoa(String.fromCharCode.apply(null, all.slice(0, 64))));
+
+    // WebGL dump
+    try {
+      const gl = new OffscreenCanvas(1,1).getContext('webgl');
+      log('webgl vendor: ' + (gl && gl.getParameter(gl.VENDOR)));
+      log('webgl renderer: ' + (gl && gl.getParameter(gl.RENDERER)));
+      const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      log('glvd: ' + (ext && ext.UNMASKED_VENDOR_WEBGL) + ' | glrd: ' + (ext && ext.UNMASKED_RENDERER_WEBGL));
+      log('powerPreference: ' + JSON.stringify(gl && gl.getContextAttributes()));
+      log('extensions: ' + (gl && gl.getSupportedExtensions().slice(0,12).join(',')));
+    } catch(e){ log('webgl err: ' + e.message); }
+
+    // font metrics for aafakefontaa + system-ui probes
+    try {
+      const c2 = new OffscreenCanvas(100, 50).getContext('2d');
+      c2.font = '200px aafakefontaa';
+      const m1 = c2.measureText('AbCdEfG123');
+      log('aafakefontaa width=' + (m1 && m1.width) + ' bbox=' + (m1 && m1.actualBoundingBoxRight) + ' ascent=' + (m1 && m1.actualBoundingBoxAscent));
+      c2.font = '200px system-ui';
+      const m2 = c2.measureText('AbCdEfG123');
+      log('system-ui width=' + (m2 && m2.width) + ' bbox=' + (m2 && m2.actualBoundingBoxRight) + ' ascent=' + (m2 && m2.actualBoundingBoxAscent));
+      c2.font = '200px Arial';
+      const m3 = c2.measureText('AbCdEfG123');
+      log('Arial width=' + (m3 && m3.width));
+    } catch(e){ log('font err: ' + e.message); }
+    log('DONE_PROBE');
+  } catch(e){ log('ERR: ' + e.message); }
+}
+
+let sensAcc = { alpha: [], beta: [], gamma: [], rota: [], rotb: [], rotc: [], ax: [], ay: [], az: [] };
+async function startSensors(){
+  try {
+    if (window.DeviceMotionEvent && DeviceMotionEvent.requestPermission) {
+      const res = await DeviceMotionEvent.requestPermission();
+      log('DeviceMotion permission: ' + res);
+    }
+    if (window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) {
+      const res2 = await DeviceOrientationEvent.requestPermission();
+      log('DeviceOrientation permission: ' + res2);
+    }
+  } catch(e){ log('perm err: ' + e.message); }
+  await runSensors();
+}
+async function runSensors(){
+  LOG.length = 0;
+  log('sensors 2.5s...');
+  sensAcc = { alpha: [], beta: [], gamma: [], rota: [], rotb: [], rotc: [], ax: [], ay: [], az: [] };
+  const o1 = e => { sensAcc.alpha.push(e.alpha); sensAcc.beta.push(e.beta); sensAcc.gamma.push(e.gamma); };
+  const o2 = e => { sensAcc.rota.push(e.rotationRate && e.rotationRate.alpha); sensAcc.rotb.push(e.rotationRate && e.rotationRate.beta); sensAcc.rotc.push(e.rotationRate && e.rotationRate.gamma);
+    sensAcc.ax.push(e.accelerationIncludingGravity && e.accelerationIncludingGravity.x); sensAcc.ay.push(e.accelerationIncludingGravity && e.accelerationIncludingGravity.y); sensAcc.az.push(e.accelerationIncludingGravity && e.accelerationIncludingGravity.z); };
+  window.addEventListener('deviceorientation', o1);
+  window.addEventListener('devicemotion', o2);
+  await new Promise(res => setTimeout(res, 2500));
+  window.removeEventListener('deviceorientation', o1);
+  window.removeEventListener('devicemotion', o2);
+  const n = sensAcc.alpha.length;
+  log('samples: ' + n);
+  if (n > 0) {
+    const sum = a => a.reduce((x,y)=>x+(y||0),0);
+    log('sumAlpha=' + sum(sensAcc.alpha).toFixed(2) + ' sum|Beta|=' + sensAcc.beta.map(Math.abs).reduce((a,b)=>a+b,0).toFixed(2) + ' sum|Gamma|=' + sensAcc.gamma.map(Math.abs).reduce((a,b)=>a+b,0).toFixed(2));
+    log('sum|rotA|=' + sensAcc.rota.map(x=>Math.abs(x||0)).reduce((a,b)=>a+b,0).toFixed(2) + ' sumAz=' + sum(sensAcc.az).toFixed(2));
+    log('alpha mean=' + (sum(sensAcc.alpha)/n).toFixed(2) + ' beta mean=' + (sum(sensAcc.beta)/n).toFixed(2) + ' gamma mean=' + (sum(sensAcc.gamma)/n).toFixed(2));
+    log('az mean=' + (sum(sensAcc.az)/n).toFixed(2));
+  }
+  log('DONE_SENSORS');
+}
+
+function copyLog(){
+  const el = document.getElementById('log');
+  if (navigator.clipboard) { navigator.clipboard.writeText(el.textContent); }
+  log('(copied)');
+}
+</script>
+</body>
+</html>
