@@ -1,0 +1,581 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device report</title>
+<style>
+ body{font:14px/1.45 -apple-system,system-ui,sans-serif;margin:16px;color:#111;background:#fff}
+ @media (prefers-color-scheme: dark){body{background:#111;color:#eee}}
+ h2{margin:0 0 4px} .muted{color:#888;font-size:12px;margin-bottom:10px}
+ #status{font-weight:600;margin:10px 0}
+ button{font:600 15px -apple-system,system-ui,sans-serif;padding:12px 18px;border-radius:10px;border:0;background:#0a84ff;color:#fff;margin:0 8px 10px 0}
+ button:disabled{opacity:.4}
+ pre{white-space:pre-wrap;word-break:break-word;background:#8881;padding:10px;border-radius:8px;font:12px/1.5 ui-monospace,Menlo,monospace}
+</style></head>
+<body>
+<h2>Device report</h2>
+<div class="muted">Runs locally in Safari. Nothing is uploaded — tap Download (or Copy) when done, save to Files, then bring it back.</div>
+<div id="status">Starting…</div>
+<button id="dl" disabled>Download JSON</button>
+<button id="cp" disabled>Copy JSON</button>
+<button id="rr">Run again</button>
+<pre id="summary">…</pre>
+<script>/*!
+ * collect.js — deep device-fingerprint collector (consent-gated, no cookies, no storage).
+ * v1.0 — for privacy research on consenting visitors only.
+ *
+ * USAGE (their site):
+ *   1) include:  <script src="collect.js"><\/script>
+ *   2) set consent + sink from your consent manager:
+ *        window.__fpConsent = true;                       // only when the user opted in
+ *        window.__fpSink = json => postToYourBackend(json); // your endpoint
+ *        window.__fpAuto = true;                          // auto-collect on load
+ *      (or call `await FPCollect.run()` yourself and send the result)
+ *   3) backend: POST the JSON string as-is; store one JSONL line per user.
+ *
+ * PRIVACY: no cookies, no localStorage, no IDs, no IP captured client-side.
+ * DP: fingerprints are personal data — keep the consent record, hash/trim on
+ * the server, store coarse geo only, define a retention period.
+ */
+(function () {
+  'use strict';
+
+  var FPC = { version: 1 };
+
+  function needConsent() {
+    var c = (typeof window !== 'undefined' && window.__fpConfig) || {};
+    return c.requireConsent !== false;                    // default: require explicit consent
+  }
+
+  /* ---------- helpers ---------- */
+  function safe(fn, dflt) {
+    try { var r = fn(); return r === undefined ? (dflt === undefined ? null : dflt) : r; }
+    catch (e) { return dflt === undefined ? null : dflt; }
+  }
+  async function asafe(fn, dflt) {
+    try { var r = await fn(); return r === undefined ? null : r; }
+    catch (e) { return dflt === undefined ? null : dflt; }
+  }
+  function hex(buf) {
+    var b = new Uint8Array(buf), s = '';
+    for (var i = 0; i < b.length; i++) s += ('0' + b[i].toString(16)).slice(-2);
+    return s;
+  }
+  async function sha256(data) {
+    try {
+      if (crypto && crypto.subtle) {
+        var ab = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        return hex(await crypto.subtle.digest('SHA-256', ab));
+      }
+    } catch (e) {}
+    // fallback FNV-1a (non-crypto) — still usable for clustering
+    var str = typeof data === 'string' ? data : String(new Uint8Array(data));
+    var h = 0x811c9dc5;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    return 'fnv' + h.toString(16);
+  }
+  function withTimeout(p, ms, dflt) {
+    return Promise.race([
+      Promise.resolve(p).catch(function () { return dflt === undefined ? null : dflt; }),
+      new Promise(function (res) { setTimeout(function () { res(dflt === undefined ? null : dflt); }, ms); })
+    ]);
+  }
+
+  /* ---------- collectors ---------- */
+
+  function nav() {
+    var n = navigator;
+    return {
+      ua: n.userAgent, platform: n.platform, vendor: n.vendor,
+      product: n.product, productSub: n.productSub,
+      language: n.language, languages: safe(function () { return (n.languages || []).slice(0, 6); }),
+      webdriver: n.webdriver === true, cookiesEnabled: n.cookieEnabled,
+      dnt: n.doNotTrack, pdfViewer: n.pdfViewerEnabled === true,
+      maxTouchPoints: n.maxTouchPoints, hardwareConcurrency: n.hardwareConcurrency,
+      deviceMemory: n.deviceMemory || null,
+      plugins: n.plugins ? n.plugins.length : null, mimeTypes: n.mimeTypes ? n.mimeTypes.length : null,
+      chrome: !!window.chrome, onLine: n.onLine
+    };
+  }
+
+  async function uaData() {
+    if (!navigator.userAgentData) return null;
+    var hi = await navigator.userAgentData.getHighEntropyValues(
+      ['architecture', 'bitness', 'model', 'platform', 'platformVersion', 'uaFullVersion', 'fullVersionList', 'wow64']);
+    return { brands: navigator.userAgentData.brands, mobile: navigator.userAgentData.mobile, high: hi };
+  }
+
+  function screenView() {
+    return {
+      screen: { w: screen.width, h: screen.height, aw: screen.availWidth, ah: screen.availHeight,
+                cd: screen.colorDepth, pd: screen.pixelDepth,
+                orientation: safe(function () { return screen.orientation && screen.orientation.type; }) },
+      viewport: { iw: innerWidth, ih: innerHeight, ow: outerWidth, oh: outerHeight, dpr: devicePixelRatio },
+      domrect: safe(function () {
+        var d = document.createElement('div');
+        d.style.cssText = 'position:fixed;left:0;top:0;width:1.5px;height:2.5px';
+        document.body.appendChild(d);
+        var r = d.getBoundingClientRect();
+        document.body.removeChild(d);
+        return { w: r.width, h: r.height };
+      })
+    };
+  }
+
+  function prefs() {
+    var q = [['dark', '(prefers-color-scheme: dark)'], ['reducedMotion', '(prefers-reduced-motion: reduce)'],
+             ['contrast', '(prefers-contrast: more)'], ['forcedColors', '(forced-colors: active)'],
+             ['inverted', '(inverted-colors: inverted)'], ['hdr', '(dynamic-range: high)'],
+             ['p3', '(color-gamut: p3)'], ['srgb', '(color-gamut: srgb)'], ['rec2020', '(color-gamut: rec2020)'],
+             ['monochrome', '(monochrome)'], ['transparency', '(prefers-reduced-transparency: reduce)'],
+             ['standalone', '(display-mode: standalone)'], ['pointerCoarse', '(pointer: coarse)'],
+             ['hoverNone', '(hover: none)']];
+    var out = {};
+    for (var i = 0; i < q.length; i++) out[q[i][0]] = safe(function () { return matchMedia(q[i][1]).matches; });
+    return out;
+  }
+
+  async function storage() {
+    var est = await navigator.storage.estimate();
+    return { quota: est.quota, usage: est.usage, persisted: await navigator.storage.persisted() };
+  }
+
+  function network() {
+    var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (!c) return null;
+    return { type: c.type || null, effectiveType: c.effectiveType || null, downlink: c.downlink || null,
+             rtt: c.rtt || null, saveData: c.saveData === true };
+  }
+
+  function features() {
+    function gl2() { return safe(function () { return !!document.createElement('canvas').getContext('webgl2'); }); }
+    function simd() {
+      return safe(function () {
+        return WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11]));
+      });
+    }
+    var f = {
+      wasm: typeof WebAssembly === 'object', wasmSimd: simd(), sharedArrayBuffer: typeof SharedArrayBuffer === 'function',
+      atomics: typeof Atomics === 'object', webgl2: gl2(), webgpu: 'gpu' in navigator,
+      offscreenCanvas: typeof OffscreenCanvas === 'function', serviceWorker: 'serviceWorker' in navigator,
+      sharedWorker: typeof SharedWorker === 'function', worker: typeof Worker === 'function',
+      bluetooth: 'bluetooth' in navigator, usb: 'usb' in navigator, hid: 'hid' in navigator, serial: 'serial' in navigator,
+      midi: 'requestMIDIAccess' in navigator, gamepad: 'getGamepads' in navigator,
+      payments: 'PaymentRequest' in window, credentials: 'credentials' in navigator,
+      speech: 'speechSynthesis' in window, vibration: 'vibrate' in navigator,
+      deviceMotion: 'DeviceMotionEvent' in window, deviceOrientation: 'DeviceOrientationEvent' in window,
+      clipboard: 'clipboard' in navigator, share: 'share' in navigator, wakeLock: 'wakeLock' in navigator,
+      contacts: 'contacts' in navigator, xr: 'xr' in navigator, mediaSession: 'mediaSession' in navigator,
+      geolocation: 'geolocation' in navigator, notifications: 'Notification' in window,
+      caches: 'caches' in window, indexedDB: !!window.indexedDB, cookiesStore: 'cookieStore' in window,
+      webkitGetUserMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+      enumerateDevices: !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices),
+      screenCapture: 'getDisplayMedia' in navigator.mediaDevices || false,
+      fullscreen: 'fullscreenEnabled' in document, pointerEvents: 'PointerEvent' in window,
+      touchEvents: 'ontouchstart' in window, cssHas: safe(function () { return CSS.supports('selector(:has(*))'); }),
+      cssContainer: safe(function () { return CSS.supports('container-type: inline-size'); })
+    };
+    return f;
+  }
+
+  function codecs() {
+    function ct(t) { return safe(function () { var v = document.createElement('video').canPlayType(t); return v || 'no'; }); }
+    function ca(t) { return safe(function () { var a = document.createElement('audio').canPlayType(t); return a || 'no'; }); }
+    return {
+      v_h264: ct('video/mp4; codecs="avc1.42E01E"'), v_h264_hi: ct('video/mp4; codecs="avc1.64001F"'),
+      v_h265: ct('video/mp4; codecs="hvc1.1.6.L93.B0"'), v_av1: ct('video/mp4; codecs="av01.0.05M.08"'),
+      v_vp8: ct('video/webm; codecs="vp8"'), v_vp9: ct('video/webm; codecs="vp9"'),
+      v_theora: ct('video/ogg; codecs="theora"'),
+      a_aac: ca('audio/mp4; codecs="mp4a.40.2"'), a_mp3: ca('audio/mpeg'), a_opus: ca('audio/ogg; codecs="opus"'),
+      a_vorbis: ca('audio/ogg; codecs="vorbis"'), a_flac: ca('audio/flac'), a_wav: ca('audio/wav')
+    };
+  }
+
+  async function media() {
+    var devs = await navigator.mediaDevices.enumerateDevices();
+    var kinds = {};
+    for (var i = 0; i < devs.length; i++) kinds[devs[i].kind] = (kinds[devs[i].kind] || 0) + 1;
+    return { kinds: kinds, total: devs.length, labelsVisible: devs.length > 0 ? !!devs[0].label : null };
+  }
+
+  async function voices() {
+    if (!window.speechSynthesis) return null;
+    function snap() {
+      var v = window.speechSynthesis.getVoices() || [];
+      return { count: v.length, first: v.slice(0, 12).map(function (x) { return x.name + '|' + x.lang; }),
+               langs: v.map(function (x) { return x.lang; }).filter(function (x, i, a) { return a.indexOf(x) === i; }).length };
+    }
+    var r = snap();
+    if (r.count === 0) {
+      r = await new Promise(function (res) {
+        var done = false;
+        function fin() { if (done) return; done = true; res(snap()); }
+        try { window.speechSynthesis.addEventListener('voiceschanged', fin); } catch (e) {}
+        setTimeout(fin, 1500);
+      });
+    }
+    return r;
+  }
+
+  var FONTS = ['Arial','Helvetica','Helvetica Neue','Times New Roman','Times','Courier New','Courier','Georgia',
+    'Verdana','Trebuchet MS','Tahoma','Palatino','Palatino Linotype','Garamond','Bookman','Comic Sans MS',
+    'Arial Black','Arial Narrow','Impact','Lucida Console','Lucida Sans Unicode','MS Sans Serif','MS Serif',
+    'Calibri','Cambria','Candara','Consolas','Constantia','Corbel','Franklin Gothic Medium','Segoe UI','Segoe Print',
+    'Copperplate','Papyrus','Optima','Baskerville','Chalkboard','Chalkboard SE','Cochin','Futura','Gill Sans',
+    'Herculanum','Hoefler Text','Lucida Grande','Marker Felt','Menlo','Monaco','Noteworthy','PT Sans','Skia',
+    'Snell Roundhand','Zapfino','Hiragino Sans','Hiragino Mincho ProN','Hiragino Kaku Gothic ProN','Osaka',
+    'PingFang SC','PingFang TC','PingFang HK','Apple SD Gothic Neo','Apple Color Emoji','Apple Symbols',
+    'Avenir','Avenir Next','DIN Alternate','DIN Condensed','Kohinoor Devanagari','Kohinoor Telugu','Kannada Sangam MN',
+    'Malayalam Sangam MN','Tamil Sangam MN','Gurmukhi MN','Bangla Sangam MN','Devanagari Sangam MN','Gujarati Sangam MN',
+    'Oriya Sangam MN','Sinhala Sangam MN','Telugu Sangam MN','Thonburi','Krungthep','Lao Sangam MN','Kailasa','Kefa',
+    'Damascus','Baghdad','Al Nile','Farah','Noto Naskh Arabic','Roboto','Droid Sans','Ubuntu','Cantarell','DejaVu Sans'];
+
+  function fonts() {
+    var c = document.createElement('canvas'), ctx = c.getContext('2d');
+    var base = ['monospace', 'sans-serif', 'serif'];
+    var baseW = {};
+    for (var b = 0; b < base.length; b++) { ctx.font = '72px ' + base[b]; baseW[base[b]] = ctx.measureText('mmmmmmmmmmlli').width; }
+    var found = [];
+    for (var i = 0; i < FONTS.length; i++) {
+      for (var j = 0; j < base.length; j++) {
+        ctx.font = '72px "' + FONTS[i] + '",' + base[j];
+        if (ctx.measureText('mmmmmmmmmmlli').width !== baseW[base[j]]) { found.push(FONTS[i]); break; }
+      }
+    }
+    return found;
+  }
+
+  async function canvasTest() {
+    var c = document.createElement('canvas');
+    c.width = 260; c.height = 60;
+    var ctx = c.getContext('2d');
+    ctx.textBaseline = 'top';
+    ctx.font = '14px "Arial"';
+    ctx.fillStyle = '#f60'; ctx.fillRect(0, 0, 120, 30);
+    ctx.fillStyle = '#069'; ctx.fillText('Cwm fjordbank glyphs vext quiz, 😃', 2, 15);
+    ctx.fillStyle = 'rgba(102, 204, 0, 0.7)'; ctx.fillText('Cwm fjordbank glyphs vext quiz, 😃', 4, 17);
+    var g = ctx.createLinearGradient(0, 0, 260, 60);
+    g.addColorStop(0, '#f00'); g.addColorStop(1, '#00f');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(210, 30, 24, 0, Math.PI * 2); ctx.fill();
+    var url = c.toDataURL();
+    var d = ctx.getImageData(0, 0, 260, 60).data, px = [];
+    for (var i = 0; i < d.length; i += 9973) px.push(d[i]);
+    return { hash: await sha256(url), len: url.length, pixels: px.slice(0, 12) };
+  }
+
+  async function webglTest() {
+    var c = document.createElement('canvas');
+    var gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) return null;
+    var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    var out = {
+      vendor: safe(function () { return gl.getParameter(gl.VENDOR); }),
+      renderer: safe(function () { return gl.getParameter(gl.RENDERER); }),
+      version: safe(function () { return gl.getParameter(gl.VERSION); }),
+      glsl: safe(function () { return gl.getParameter(gl.SHADING_LANGUAGE_VERSION); }),
+      unmaskedVendor: dbg ? safe(function () { return gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL); }) : null,
+      unmaskedRenderer: dbg ? safe(function () { return gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL); }) : null,
+      extensions: safe(function () { return (gl.getSupportedExtensions() || []).sort(); })
+    };
+    var names = ['MAX_TEXTURE_SIZE','MAX_VIEWPORT_DIMS','MAX_RENDERBUFFER_SIZE','MAX_VERTEX_ATTRIBS',
+      'MAX_VERTEX_UNIFORM_VECTORS','MAX_FRAGMENT_UNIFORM_VECTORS','MAX_VARYING_VECTORS','MAX_CUBE_MAP_TEXTURE_SIZE',
+      'MAX_TEXTURE_IMAGE_UNITS','MAX_VERTEX_TEXTURE_IMAGE_UNITS','MAX_COMBINED_TEXTURE_IMAGE_UNITS',
+      'ALIASED_LINE_WIDTH_RANGE','ALIASED_POINT_SIZE_RANGE'];
+    out.params = {};
+    for (var i = 0; i < names.length; i++) out.params[names[i]] = safe(function () { return gl.getParameter(gl[names[i]]); });
+    out.precision = {};
+    var shs = ['VERTEX_SHADER', 'FRAGMENT_SHADER'], prs = ['LOW_FLOAT','MEDIUM_FLOAT','HIGH_FLOAT','LOW_INT','MEDIUM_INT','HIGH_INT'];
+    for (var s = 0; s < shs.length; s++) for (var p = 0; p < prs.length; p++) {
+      out.precision[shs[s] + '_' + prs[p]] = safe(function () {
+        var f = gl.getShaderPrecisionFormat(gl[shs[s]], gl[prs[p]]);
+        return f ? [f.rangeMin, f.rangeMax, f.precision] : null;
+      });
+    }
+    // tiny render + pixel hash
+    try {
+      var vs = gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(vs, 'attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}'); gl.compileShader(vs);
+      var fs = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fs, 'precision mediump float;void main(){gl_FragColor=vec4(1.,.5,.25,1.);}'); gl.compileShader(fs);
+      var pr = gl.createProgram(); gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr); gl.useProgram(pr);
+      var buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+      var loc = gl.getAttribLocation(pr, 'a'); gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      gl.viewport(0, 0, 16, 16); gl.drawArrays(gl.TRIANGLES, 0, 3);
+      var pix = new Uint8Array(16 * 16 * 4); gl.readPixels(0, 0, 16, 16, gl.RGBA, gl.UNSIGNED_BYTE, pix);
+      out.pixelHash = await sha256(pix);
+    } catch (e) { out.pixelHash = null; }
+    return out;
+  }
+
+  async function webgpuTest() {
+    if (!navigator.gpu) return null;
+    var adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return null;
+    var info = adapter.info ? { vendor: adapter.info.vendor, architecture: adapter.info.architecture,
+                                device: adapter.info.device, description: adapter.info.description } : null;
+    var limits = {};
+    var L = adapter.limits;
+    if (L) ['maxTextureDimension2D','maxBufferSize','maxComputeWorkgroupSizeX','maxStorageBufferBindingSize',
+            'maxBindGroups','maxVertexBuffers','maxTextureArrayLayers'].forEach(function (k) { if (k in L) limits[k] = L[k]; });
+    return { info: info, features: safe(function () { return Array.from(adapter.features || []).sort(); }), limits: limits };
+  }
+
+  async function audioTest() {
+    var Ctor = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!Ctor) return null;
+    var ctx = new Ctor(1, 44100, 44100);
+    var osc = ctx.createOscillator();
+    osc.type = 'triangle'; osc.frequency.value = 10000;
+    var comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -50; comp.knee.value = 40; comp.ratio.value = 12; comp.attack.value = 0; comp.release.value = 0.25;
+    osc.connect(comp); comp.connect(ctx.destination); osc.start(0); osc.stop(1);
+    var buf = await ctx.startRendering();
+    var data = buf.getChannelData(0);
+    var sum = 0;
+    for (var i = 4500; i < 5000; i++) sum += Math.abs(data[i]);
+    var hash = await sha256(new Float32Array(data.slice(0, 4096)));
+    var ac = null;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { var a = new AC(); ac = { sr: a.sampleRate, baseLatency: a.baseLatency }; a.close(); }
+    } catch (e) {}
+    return { sum: sum, hash: hash, sampleRate: ctx.sampleRate, live: ac };
+  }
+
+  /* Full public math vector set (union of FingerprintJS open-source, CreepJS, neoprint). */
+  function mathTest() {
+    var M = Math, E = {};
+    function add(k, fn) { E[k] = safe(fn); }
+    add('eps', function(){ return '' + Number.EPSILON; });
+    add('third', function(){ return '' + (1/3); });
+    add('sum01', function(){ return '' + (0.1+0.2); });
+    add('acos_1', function(){ return '' + M.acos(0.123); });
+    add('acos_2', function(){ return '' + M.acos(0.123124234234234242); });
+    add('acos_sqrt12', function(){ return '' + M.acos(M.SQRT1_2); });
+    add('acosh_pi', function(){ return '' + M.acosh(M.PI); });
+    add('acosh_1e10', function(){ return '' + M.acosh(1e10); });
+    add('acosh_1e308', function(){ return '' + M.acosh(1e308); });
+    add('acosh_1e154', function(){ return '' + M.acosh(1e154); });
+    add('asin_1', function(){ return '' + M.asin(0.123); });
+    add('asin_2', function(){ return '' + M.asin(0.123124234234234242); });
+    add('asinh_1', function(){ return '' + M.asinh(1); });
+    add('asinh_pi', function(){ return '' + M.asinh(M.PI); });
+    add('atan_05', function(){ return '' + M.atan(0.5); });
+    add('atan_2', function(){ return '' + M.atan(2); });
+    add('atan_pi', function(){ return '' + M.atan(M.PI); });
+    add('atanh_05', function(){ return '' + M.atanh(0.5); });
+    add('atan2_1', function(){ return '' + M.atan2(0.04, -0.04); });
+    add('atan2_2', function(){ return '' + M.atan2(1e-310, 2); });
+    add('cbrt_100', function(){ return '' + M.cbrt(100); });
+    add('cbrt_pi', function(){ return '' + M.cbrt(M.PI); });
+    add('cos_1', function(){ return '' + M.cos(10.000000000123); });
+    add('cos_2', function(){ return '' + M.cos(21*M.LN2); });
+    add('cos_3', function(){ return '' + M.cos(21*M.SQRT1_2); });
+    add('cosh_1', function(){ return '' + M.cosh(1); });
+    add('cosh_pi', function(){ return '' + M.cosh(M.PI); });
+    add('cosh_492', function(){ return '' + M.cosh(492*M.LOG2E); });
+    add('expm1_1', function(){ return '' + M.expm1(1); });
+    add('expm1_pi', function(){ return '' + M.expm1(M.PI); });
+    add('exp_1', function(){ return '' + M.exp(1); });
+    add('exp_pi', function(){ return '' + M.exp(M.PI); });
+    add('hypot_1', function(){ return '' + M.hypot(1,2,3,4,5,6); });
+    add('hypot_2', function(){ return '' + M.hypot(M.LOG2E, -100); });
+    add('log_10', function(){ return '' + M.log(10); });
+    add('log_pi', function(){ return '' + M.log(M.PI); });
+    add('log1p_10', function(){ return '' + M.log1p(10); });
+    add('log1p_pi', function(){ return '' + M.log1p(M.PI); });
+    add('log2_7', function(){ return '' + M.log2(7); });
+    add('log10_7', function(){ return '' + M.log10(7); });
+    add('log10_2', function(){ return '' + M.log10(M.LOG10E); });
+    add('log10_3', function(){ return '' + M.log10(7*M.LOG10E); });
+    add('pow_pi_neg100', function(){ return '' + M.pow(M.PI, -100); });
+    add('pow_2e3_neg100', function(){ return '' + M.pow(2e-3, -100); });
+    add('sin_pi', function(){ return '' + M.sin(M.PI); });
+    add('sin_39e', function(){ return '' + M.sin(39*M.E); });
+    add('sin_neg1e300', function(){ return '' + M.sin(-1e300); });
+    add('sin_1e300', function(){ return '' + M.sin(1e300); });
+    add('sinh_1', function(){ return '' + M.sinh(1); });
+    add('sinh_pi', function(){ return '' + M.sinh(M.PI); });
+    add('sinh_492', function(){ return '' + M.sinh(492*M.LOG2E); });
+    add('sqrt_2', function(){ return '' + M.sqrt(2); });
+    add('sqrt_0123', function(){ return '' + M.sqrt(0.123); });
+    add('tan_pi', function(){ return '' + M.tan(M.PI); });
+    add('tan_10log2e', function(){ return '' + M.tan(10*M.LOG2E); });
+    add('tan_neg1e300', function(){ return '' + M.tan(-1e300); });
+    add('tan_1e300', function(){ return '' + M.tan(1e300); });
+    add('tanh_0123', function(){ return '' + M.tanh(0.123); });
+    add('tanh_1', function(){ return '' + M.tanh(1); });
+    add('tanh_pi', function(){ return '' + M.tanh(M.PI); });
+    return E;
+  }
+
+  function perfTest() {
+    var ACC = 0; // feeds every result so the JIT can't eliminate the work
+    function bench(fn, iters) {
+      var t0 = performance.now();
+      for (var i = 0; i < iters; i++) ACC += fn(i);
+      return performance.now() - t0;
+    }
+    function best(fn, iters, runs) {
+      var m = Infinity;
+      for (var r = 0; r < (runs || 2); r++) m = Math.min(m, bench(fn, iters));
+      return m;
+    }
+    var out = {};
+    out.float = best(function () { var x = 1.000001; x = x * 1.0000001 + 0.0000001; return x; }, 100000, 3);
+    out.trig = best(function (i) { return Math.sin(i * 0.001) + Math.cos(i * 0.002); }, 100000, 3);
+    out.pow = best(function (i) { return Math.pow(1.0001 + i * 1e-9, 2.5); }, 50000, 3);
+    out.sort = best(function () { var a = [9,3,7,1,8,2,6,4,5,0]; a.sort(function (x, y) { return x - y; }); return a[0]; }, 20000, 3);
+    out.matrix = best(function () {
+      var m = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]];
+      var r = [[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]];
+      for (var i2 = 0; i2 < 4; i2++) for (var j = 0; j < 4; j++) { var s = 0; for (var k = 0; k < 4; k++) s += m[i2][k] * m[k][j]; r[i2][j] = s; }
+      return r[0][0];
+    }, 30000, 3);
+    // timer resolution: min non-zero delta of performance.now() over calls
+    var last = performance.now(), minD = Infinity;
+    for (var i = 0; i < 20000; i++) { var t = performance.now(); var d = t - last; if (d > 0 && d < minD) minD = d; last = t; }
+    out.timerRes = minD === Infinity ? null : minD;
+    out.acc = Math.round(ACC) % 1000;
+    return out;
+  }
+
+  function intl() {
+    return {
+      dt: safe(function () { var o = new Intl.DateTimeFormat().resolvedOptions(); return { locale: o.locale, calendar: o.calendar, numbering: o.numberingSystem, tz: o.timeZone, hourCycle: o.hourCycle }; }),
+      coll: safe(function () { var o = new Intl.Collator().resolvedOptions(); return { locale: o.locale, collation: o.collation }; }),
+      tzOffset: new Date().getTimezoneOffset()
+    };
+  }
+
+  function emoji() {
+    var c = document.createElement('canvas'), ctx = c.getContext('2d');
+    ctx.font = '32px "Apple Color Emoji",sans-serif';
+    var em = ['😃','😢','👨‍👩‍👧‍👦','🇺🇸','✌️','🤖','❤️','👍🏽'];
+    var w = [];
+    for (var i = 0; i < em.length; i++) w.push(Math.round(ctx.measureText(em[i]).width * 100) / 100);
+    return { widths: w };
+  }
+
+  async function battery() {
+    if (!navigator.getBattery) return null;
+    var b = await navigator.getBattery();
+    return { charging: b.charging, level: b.level };
+  }
+
+  /* ---------- main ---------- */
+  FPC.run = async function () {
+    var consentRequired = needConsent();
+    if (consentRequired && !window.__fpConsent) return null;   // hard gate (configurable)
+    var out = { v: FPC.version, ts: Date.now(), consent: consentRequired ? 'explicit' : 'tos' };
+    var errs = [];
+    async function sect(name, fn) {
+      try { out[name] = await fn(); } catch (e) { errs.push(name); out[name] = null; }
+    }
+    out.nav = safe(nav);
+    await sect('uaData', uaData);
+    Object.assign(out, safe(screenView));                  // screen, viewport, domrect
+    out.prefs = safe(prefs);
+    await sect('storage', storage);
+    out.network = safe(network);
+    out.features = safe(features);
+    out.codecs = safe(codecs);
+    await sect('media', media);
+    await sect('voices', voices);
+    out.fonts = safe(function () { var f = fonts(); return { list: f, hash: null }; });
+    await sect('canvas', canvasTest);
+    await sect('webgl', function () { return withTimeout(webglTest(), 4000, null); });
+    await sect('webgpu', function () { return withTimeout(webgpuTest(), 4000, null); });
+    await sect('audio', function () { return withTimeout(audioTest(), 5000, null); });
+    out.math = safe(mathTest);
+    out.perf = safe(perfTest);
+    out.intl = safe(intl);
+    out.emoji = safe(emoji);
+    await sect('battery', battery);
+    // hashes for quick clustering
+    out.hashes = {};
+    if (out.fonts && out.fonts.list) out.fonts.hash = await sha256(JSON.stringify(out.fonts.list));
+    if (out.math) out.hashes.math = await sha256(JSON.stringify(out.math));
+    out.hashes.core = await sha256(JSON.stringify([out.nav && out.nav.ua, out.canvas && out.canvas.hash,
+      out.webgl && out.webgl.unmaskedRenderer, out.audio && out.audio.hash, out.screen, out.viewport,
+      out.hardwareConcurrency, out.fonts && out.fonts.hash].map(function (x) { return JSON.stringify(x); })));
+    out.errors = errs;
+    return out;
+  };
+
+  window.FPCollect = FPC;
+  var autoRan = false;
+  function auto() {
+    if (autoRan || !window.__fpAuto) return;
+    if (needConsent() && !window.__fpConsent) return;
+    autoRan = true;
+    FPC.run().then(function (d) {
+      if (d && typeof window.__fpSink === 'function') { try { window.__fpSink(JSON.stringify(d)); } catch (e) {} }
+    });
+  }
+  FPC.auto = auto;                    // call this from your consent callback
+  auto();                             // try now (config/flags may already be set)
+  window.addEventListener('load', auto);  // and/or once everything is ready
+})();
+</script>
+<script>
+window.__fpConfig = { requireConsent: false };
+window.__fpAuto = false;
+var st = document.getElementById('status');
+var out = document.getElementById('summary');
+function short(h) { return (typeof h === 'string' && h.length > 20) ? h.slice(0, 10) + '…' + h.slice(-6) : h; }
+function L(a, k, v) { a.push((k + '             ').slice(0, 13) + ' ' + v); }
+function collectNow() {
+  st.textContent = 'Collecting… (5–10 seconds)';
+  out.textContent = '…';
+  FPCollect.run().then(function (d) {
+    if (!d) { st.textContent = 'Collector returned nothing.'; return; }
+    var lines = [];
+    var n = d.nav || {}, sc = d.screen || {}, vp = d.viewport || {}, c = d.canvas || {}, g = d.webgl || {};
+    var gp = d.webgpu || {}, au = d.audio || {}, f = d.fonts || {}, m = d.math || {}, h = d.hashes || {};
+    var pf = d.perf || {}, cd = d.codecs || {}, md = d.media || {}, sg = d.storage || {};
+    L(lines, 'device', String(n.ua || '').slice(0, 74));
+    L(lines, 'screen', sc.w + 'x' + sc.h + ' @' + vp.dpr + '  viewport ' + vp.iw + 'x' + vp.ih);
+    L(lines, 'cores/mem', n.hardwareConcurrency + ' / ' + (n.deviceMemory == null ? '—' : n.deviceMemory));
+    L(lines, 'platform', (n.platform || '') + ' | touch ' + n.maxTouchPoints);
+    L(lines, 'canvas', short(c.hash) + '  len ' + c.len);
+    L(lines, 'webgl', (g.unmaskedRenderer || g.renderer || '—') + '  ext ' + ((g.extensions || []).length) + '  px ' + short(g.pixelHash));
+    L(lines, 'webgpu', gp.info ? (gp.info.vendor + '/' + gp.info.architecture + '  feats ' + ((gp.features || []).length)) : '—');
+    L(lines, 'audio', short(au.hash) + '  sum ' + au.sum + ' @' + au.sampleRate);
+    L(lines, 'fonts', ((f.list || []).length) + ' found  hash ' + short(f.hash));
+    L(lines, 'math', Object.keys(m).length + ' values  pow(PI,-100)=' + m.pow_pi_neg100);
+    L(lines, 'math hash', short(h.math));
+    L(lines, 'perf ms', 'float ' + pf.float + '  trig ' + pf.trig + '  pow ' + pf.pow + '  sort ' + pf.sort + '  matrix ' + pf.matrix + '  res ' + pf.timerRes);
+    L(lines, 'codecs', Object.keys(cd).filter(function (k) { return cd[k] && cd[k] !== 'no'; }).length + ' supported');
+    L(lines, 'media', JSON.stringify(md.kinds || {}));
+    L(lines, 'storage', sg.quota ? (sg.quota / 1e9).toFixed(1) + ' GB quota' : '—');
+    L(lines, 'prefs', ['dark', 'reducedMotion', 'hdr', 'p3', 'forcedColors'].map(function (k) { return k + '=' + ((d.prefs || {})[k]); }).join(' '));
+    L(lines, 'ua-ch', d.uaData ? (d.uaData.high ? (d.uaData.high.platform + ' ' + (d.uaData.high.model || '')) : '—') : '— (Safari)');
+    L(lines, 'voices', String((d.voices && d.voices.count) != null ? d.voices.count : '—'));
+    L(lines, 'emoji w', JSON.stringify((d.emoji || {}).widths));
+    L(lines, 'errors', JSON.stringify(d.errors || []));
+    var json = JSON.stringify(d);
+    L(lines, 'size', json.length + ' bytes  (basis: ' + d.consent + ')');
+    out.textContent = lines.join('\n');
+    st.textContent = 'Done — tap Download, save to Files.';
+    var dl = document.getElementById('dl');
+    dl.disabled = false;
+    dl.onclick = function () {
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+      a.download = 'fingerprint-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+      document.body.appendChild(a); a.click(); a.remove();
+    };
+    var cp = document.getElementById('cp');
+    cp.disabled = false;
+    cp.onclick = function () {
+      navigator.clipboard.writeText(json).then(function () { cp.textContent = 'Copied'; }, function () { cp.textContent = 'Copy failed'; });
+    };
+    window.__fpDone = true;
+  }).catch(function (e) { st.textContent = 'Error: ' + e; });
+}
+document.getElementById('rr').onclick = function () { location.reload(); };
+collectNow();
+</script>
+</body></html>
